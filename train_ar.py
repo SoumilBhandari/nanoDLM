@@ -123,8 +123,14 @@ def get_lr(step):
 
 
 # training loop -------------------------------------------------------------
+# A 10M-param AR overfits hard on 1MB of Shakespeare. Track the best-val
+# checkpoint and save THAT as ckpt_ar.pt; eval.py uses this one. This is the
+# honest baseline — the late-step checkpoint memorises the train split and
+# is not what anyone would actually deploy from a single AR training run.
 print(f"training for {cfg.max_steps} steps")
 t0 = time.time()
+best_val = float("inf")
+ckpt_path = os.path.join(cfg.out_dir, "ckpt_ar.pt")
 for step in range(cfg.max_steps + 1):
     lr = get_lr(step)
     for g in optimizer.param_groups:
@@ -133,8 +139,15 @@ for step in range(cfg.max_steps + 1):
     if step % cfg.eval_interval == 0:
         losses = estimate_loss()
         dt = time.time() - t0
+        flag = ""
+        if losses["val"] < best_val:
+            best_val = losses["val"]
+            m = model._orig_mod if hasattr(model, "_orig_mod") else model
+            torch.save({"model": m.state_dict(), "config": cfg.__dict__,
+                        "step": step, "val": best_val}, ckpt_path)
+            flag = "  *best, saved"
         print(f"step {step:5d} | train {losses['train']:.3f} | val {losses['val']:.3f} | "
-              f"lr {lr:.2e} | {dt:6.1f}s")
+              f"lr {lr:.2e} | {dt:6.1f}s{flag}")
 
     if step > 0 and step % cfg.sample_interval == 0:
         out = sample_ar([0], length=128)        # prompt = newline
@@ -153,8 +166,4 @@ for step in range(cfg.max_steps + 1):
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
-# save ----------------------------------------------------------------------
-m = model._orig_mod if hasattr(model, "_orig_mod") else model
-ckpt_path = os.path.join(cfg.out_dir, "ckpt_ar.pt")
-torch.save({"model": m.state_dict(), "config": cfg.__dict__}, ckpt_path)
-print(f"saved {ckpt_path}")
+print(f"best val: {best_val:.3f} (checkpoint saved to {ckpt_path})")
