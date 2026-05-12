@@ -36,6 +36,10 @@ if __name__ == "__main__":
                    help="how many tokens to generate between prefix and suffix")
     p.add_argument("--steps", type=int, default=64)
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--top-p", type=float, default=0.9,
+                   help="nucleus truncation before categorical sampling (1.0 disables)")
+    p.add_argument("--no-self-cond", action="store_true",
+                   help="disable inference-time self-conditioning")
     p.add_argument("--verbose", action="store_true",
                    help="print intermediate denoising states (watch text crystallize)")
     args = p.parse_args()
@@ -62,7 +66,8 @@ if __name__ == "__main__":
     x_init[0, total_length - len(suffix_ids):] = torch.tensor(suffix_ids, device=device)
 
     out = generate(model, x_init=x_init, steps=args.steps,
-                   temperature=args.temperature, device=device,
+                   temperature=args.temperature, top_p=args.top_p,
+                   self_cond=not args.no_self_cond, device=device,
                    verbose=args.verbose, itos=itos)
 
     text = _decode(out[0].tolist(), itos, model.mask_id)
