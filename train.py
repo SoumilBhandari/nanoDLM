@@ -61,8 +61,12 @@ model = DLM(cfg).to(device)
 MASK_ID = model.mask_id
 optimizer = model.configure_optimizers(cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2))
 if cfg.compile and device == "cuda":
-    print("compiling model...")
-    model = torch.compile(model)
+    try:
+        import triton  # noqa: F401
+        print("compiling model...")
+        model = torch.compile(model)
+    except ImportError:
+        print("triton not installed; skipping torch.compile (training will run, just slower)")
 
 
 def loss_fn(model, x):
