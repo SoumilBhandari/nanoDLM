@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+data/*.bin
+data/*.pkl
+data/input.txt
+out/
+*.pt
+.DS_Store
