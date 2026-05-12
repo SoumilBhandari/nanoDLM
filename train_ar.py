@@ -1,10 +1,15 @@
-"""Train a masked-diffusion language model on tiny Shakespeare.
+"""Train the autoregressive baseline.
 
-The pedagogical payload is the eight-line training step in `loss_fn` below:
-sample a per-example noise level t, mask each token independently with prob t,
-predict the masked tokens, and weight the cross-entropy by 1/t.
+Same hyperparameters as train.py (MDM), so the comparison is apples-to-apples
+at matched architecture and matched token-throughput. The only structural
+differences:
 
-Everything else is standard nanoGPT-style scaffolding.
+  - No diffusion noise/mask: each batch is just (x, y) with y = x shifted by 1.
+  - Loss is standard next-token cross-entropy.
+  - No self-conditioning, no two-pass step (so each batch is ~1.5x faster
+    than the MDM's mixed 1-pass / 2-pass batches).
+
+Output: out/ckpt_ar.pt — picked up by eval.py for the head-to-head table.
 """
 import math
 import os
@@ -16,8 +21,7 @@ import numpy as np
 import torch
 
 from config import Config
-from model import DLM
-from sample import generate
+from model_ar import ARLM
 
 cfg = Config()
 torch.manual_seed(cfg.seed)
@@ -39,26 +43,28 @@ with open(os.path.join(data_dir, "meta.pkl"), "rb") as f:
     meta = pickle.load(f)
 cfg.vocab_size = meta["vocab_size"]
 itos = meta["itos"]
-print(f"vocab size: {cfg.vocab_size} (+1 [MASK])")
+print(f"vocab size: {cfg.vocab_size}")
 
 train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
 val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
 
 
 def get_batch(split):
+    """Returns (x, y) with y the next-token target of x (shifted by 1)."""
     data = train_data if split == "train" else val_data
-    ix = torch.randint(len(data) - cfg.block_size, (cfg.batch_size,))
+    ix = torch.randint(len(data) - cfg.block_size - 1, (cfg.batch_size,))
     x = torch.stack([torch.from_numpy(data[i : i + cfg.block_size].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(data[i + 1 : i + 1 + cfg.block_size].astype(np.int64)) for i in ix])
     if device == "cuda":
         x = x.pin_memory().to(device, non_blocking=True)
+        y = y.pin_memory().to(device, non_blocking=True)
     else:
-        x = x.to(device)
-    return x
+        x, y = x.to(device), y.to(device)
+    return x, y
 
 
 # model ---------------------------------------------------------------------
-model = DLM(cfg).to(device)
-MASK_ID = model.mask_id
+model = ARLM(cfg).to(device)
 optimizer = model.configure_optimizers(cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2))
 if cfg.compile and device == "cuda":
     try:
@@ -69,43 +75,6 @@ if cfg.compile and device == "cuda":
         print("triton not installed; skipping torch.compile (training will run, just slower)")
 
 
-def loss_fn(model, x, self_cond_prob: float = 0.5):
-    """The whole pedagogical payload of nanoDLM.
-
-    Self-conditioning (Chen et al. 2023): with probability self_cond_prob,
-    do an extra no-grad forward to get the model's own argmax prediction
-    and feed it back as idx_prev on the gradient-bearing forward. Otherwise
-    idx_prev is None and the cond_proj path is a no-op (zero-init). At
-    matched param count this is documented to lift MDM val by ~0.05-0.15
-    nats. Cost: ~50% wallclock since half the batches do 2 forwards.
-    """
-    B, T = x.shape
-    t = torch.rand(B, 1, device=x.device).clamp(min=cfg.eps)   # per-sample noise
-    mask = torch.rand(B, T, device=x.device) < t               # Bernoulli(t)
-    x_t = torch.where(mask, MASK_ID, x)                        # corrupt
-
-    idx_prev = None
-    if torch.rand(()).item() < self_cond_prob:
-        # No-grad first pass produces the self-conditioning input. argmax is
-        # safe because logits[..., MASK_ID] is -inf so MASK is never picked.
-        with torch.no_grad():
-            idx_prev = model(x_t).argmax(dim=-1)
-
-    logits = model(x_t, idx_prev)                              # (B, T, V_with_mask)
-    loss_tok = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        x.reshape(-1),
-        reduction="none",
-    ).view(B, T)
-    # Sahoo et al. 2024 §3 ELBO: divide by the deterministic constant B*T,
-    # not by the stochastic mask.sum(). With the stochastic denominator the
-    # reported loss is ~2H instead of H, the small-t signal gets diluted by
-    # heavily-masked siblings in the same batch, and per-batch gradient scale
-    # depends on the random mask draw. The proper estimator below is the
-    # standard MDM-NELBO and converges to nats/char.
-    return (loss_tok * mask / t).sum() / (B * T)
-
-
 @torch.no_grad()
 def estimate_loss():
     model.eval()
@@ -113,14 +82,37 @@ def estimate_loss():
     for split in ("train", "val"):
         losses = torch.zeros(cfg.eval_iters)
         for k in range(cfg.eval_iters):
+            x, y = get_batch(split)
             with ctx:
-                # Disable self-conditioning at eval so val loss is directly
-                # comparable to runs without self-cond. The deployment-time
-                # behaviour (self-cond always on) is what `sample.py` exercises.
-                losses[k] = loss_fn(model, get_batch(split), self_cond_prob=0.0)
+                _, loss = model(x, y)
+            losses[k] = loss.item()
         out[split] = losses.mean().item()
     model.train()
     return out
+
+
+@torch.no_grad()
+def sample_ar(prompt_ids, length=128, temperature=1.0, top_p=0.9):
+    """Greedy-like autoregressive sample for the in-training preview."""
+    model.eval()
+    m = model._orig_mod if hasattr(model, "_orig_mod") else model
+    x = torch.tensor(prompt_ids, dtype=torch.long, device=device)[None]
+    for _ in range(length):
+        idx_cond = x[:, -cfg.block_size:]
+        logits = m(idx_cond)[:, -1, :] / temperature
+        probs = logits.softmax(-1)
+        # Top-p truncation (same trick as sample.py)
+        if top_p < 1.0:
+            sp, si = probs.sort(dim=-1, descending=True)
+            cum = sp.cumsum(dim=-1)
+            drop = (cum - sp) > top_p
+            sp = sp.masked_fill(drop, 0.0)
+            probs = torch.zeros_like(probs).scatter_(-1, si, sp)
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        nxt = torch.multinomial(probs, 1)
+        x = torch.cat([x, nxt], dim=1)
+    model.train()
+    return x
 
 
 def get_lr(step):
@@ -131,12 +123,14 @@ def get_lr(step):
 
 
 # training loop -------------------------------------------------------------
-# Save the best-val checkpoint (not just the last one) — matches train_ar.py
-# and means `out/ckpt.pt` is always the model `eval.py` should compare.
+# A 10M-param AR overfits hard on 1MB of Shakespeare. Track the best-val
+# checkpoint and save THAT as ckpt_ar.pt; eval.py uses this one. This is the
+# honest baseline — the late-step checkpoint memorises the train split and
+# is not what anyone would actually deploy from a single AR training run.
 print(f"training for {cfg.max_steps} steps")
 t0 = time.time()
 best_val = float("inf")
-ckpt_path = os.path.join(cfg.out_dir, "ckpt.pt")
+ckpt_path = os.path.join(cfg.out_dir, "ckpt_ar.pt")
 for step in range(cfg.max_steps + 1):
     lr = get_lr(step)
     for g in optimizer.param_groups:
@@ -156,18 +150,17 @@ for step in range(cfg.max_steps + 1):
               f"lr {lr:.2e} | {dt:6.1f}s{flag}")
 
     if step > 0 and step % cfg.sample_interval == 0:
-        print("--- sample (steps=64) ---")
-        m = model._orig_mod if hasattr(model, "_orig_mod") else model
-        out = generate(m, length=128, steps=64, device=device, verbose=False)
+        out = sample_ar([0], length=128)        # prompt = newline
+        print("--- AR sample ---")
         print("".join(itos[int(i)] for i in out[0].tolist()))
-        print("-------------------------")
+        print("-----------------")
 
     if step == cfg.max_steps:
         break
 
-    x = get_batch("train")
+    x, y = get_batch("train")
     with ctx:
-        loss = loss_fn(model, x)
+        _, loss = model(x, y)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
     optimizer.step()
