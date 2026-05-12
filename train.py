@@ -82,7 +82,13 @@ def loss_fn(model, x):
         x.reshape(-1),
         reduction="none",
     ).view(B, T)
-    return (loss_tok * mask / t).sum() / mask.sum().clamp(min=1)
+    # Sahoo et al. 2024 §3 ELBO: divide by the deterministic constant B*T,
+    # not by the stochastic mask.sum(). With the stochastic denominator the
+    # reported loss is ~2H instead of H, the small-t signal gets diluted by
+    # heavily-masked siblings in the same batch, and per-batch gradient scale
+    # depends on the random mask draw. The proper estimator below is the
+    # standard MDM-NELBO and converges to nats/char.
+    return (loss_tok * mask / t).sum() / (B * T)
 
 
 @torch.no_grad()
