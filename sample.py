@@ -6,6 +6,7 @@ masked and are revisited next step. This is the magic moment of nanoDLM —
 print the partially-denoised string each step and watch text crystallize.
 """
 import argparse
+import math
 import os
 import pickle
 
@@ -13,6 +14,28 @@ import torch
 
 from config import Config
 from model import DLM
+
+
+def _schedule_frac(i: int, steps: int, mode: str) -> float:
+    """Fraction of initially-masked positions to keep masked AFTER step i (0-indexed).
+
+    Three schedules:
+      - linear         (default; LLaDA / MDLM / MD4 convention): commit a
+                       constant 1/steps of the masked positions per step.
+      - cosine         frac = cos((i+1)/steps * π/2). Slower commits early,
+                       faster late. The diffusion-literature default for
+                       continuous variants. Late commits get richer context.
+      - cosine_inv     frac = 1 - sin((i+1)/steps * π/2). Faster commits early,
+                       slower late. Spends compute refining the harder tail.
+    """
+    progress = (i + 1) / steps
+    if mode == "linear":
+        return 1.0 - progress
+    if mode == "cosine":
+        return math.cos(progress * math.pi / 2)
+    if mode == "cosine_inv":
+        return 1.0 - math.sin(progress * math.pi / 2)
+    raise ValueError(f"unknown schedule {mode!r}")
 
 
 def _top_p_filter(probs: torch.Tensor, top_p: float) -> torch.Tensor:
@@ -35,7 +58,8 @@ def _top_p_filter(probs: torch.Tensor, top_p: float) -> torch.Tensor:
 
 @torch.no_grad()
 def generate(model, length=256, steps=64, temperature=1.0, top_p=0.9, device="cpu",
-             verbose=False, itos=None, x_init=None, self_cond=True):
+             verbose=False, itos=None, x_init=None, self_cond=True,
+             schedule: str = "linear"):
     """Generate via `steps` rounds of low-confidence remasking.
 
     Two modes:
@@ -89,7 +113,7 @@ def generate(model, length=256, steps=64, temperature=1.0, top_p=0.9, device="cp
         idx_prev = pred
 
         # Schedule: how many tokens should still be MASKed after this step.
-        frac_remaining = 1.0 - (i + 1) / steps
+        frac_remaining = _schedule_frac(i, steps, schedule)
         n_keep_masked = int(frac_remaining * n_to_fill)
 
         is_masked = (x == model.mask_id)
@@ -147,6 +171,9 @@ if __name__ == "__main__":
                    help="nucleus truncation before categorical sampling (1.0 disables)")
     p.add_argument("--no-self-cond", action="store_true",
                    help="disable inference-time self-conditioning")
+    p.add_argument("--schedule", default="linear",
+                   choices=["linear", "cosine", "cosine_inv"],
+                   help="masking schedule across denoising steps")
     p.add_argument("--ablate", action="store_true",
                    help="sweep steps in {1, 4, 16, 64, 256} to show the lesson")
     p.add_argument("--verbose", action="store_true",
@@ -166,13 +193,14 @@ if __name__ == "__main__":
         for s in (1, 4, 16, 64, 256):
             out = generate(model, length=args.length, steps=s, device=device,
                            temperature=args.temperature, top_p=args.top_p,
-                           self_cond=not args.no_self_cond)
+                           self_cond=not args.no_self_cond, schedule=args.schedule)
             print(f"\n--- steps={s} ---")
             print(_decode(out[0].tolist(), itos, model.mask_id))
     else:
         out = generate(model, length=args.length, steps=args.steps,
                        device=device, temperature=args.temperature,
                        top_p=args.top_p, self_cond=not args.no_self_cond,
+                       schedule=args.schedule,
                        verbose=args.verbose, itos=itos)
         print("\n=== final ===")
         print(_decode(out[0].tolist(), itos, model.mask_id))

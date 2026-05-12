@@ -117,13 +117,14 @@ def score_with_ar(ar_model, text_ids: torch.Tensor, cfg: Config) -> float:
 @torch.no_grad()
 def sample_ppl_under_ar(model, ar_model, cfg: Config, n_samples: int = 16,
                         length: int = 256, steps: int = 64, is_mdm: bool = True,
-                        temperature: float = 1.0, top_p: float = 0.9) -> float:
+                        temperature: float = 1.0, top_p: float = 0.9,
+                        schedule: str = "linear") -> float:
     """Generate n_samples from `model` and score them under `ar_model`. PPL = exp(NLL)."""
     all_ids = []
     if is_mdm:
         for _ in range(n_samples):
             out = generate(model, length=length, steps=steps, temperature=temperature,
-                           top_p=top_p, device="cuda")
+                           top_p=top_p, schedule=schedule, device="cuda")
             all_ids.append(out)
     else:
         # AR sampling
@@ -249,10 +250,15 @@ def main():
     mdm_elbo = mdm_val_elbo(mdm, val_data, mdm_cfg, eps=mdm_cfg.eps, n_batches=args.n_batches)
     ar_nll = ar_val_nll(ar, val_data, ar_cfg, n_batches=args.n_batches)
 
-    print("[2/5] sample PPL-under-AR (MDM samples) ...")
-    mdm_ppl = sample_ppl_under_ar(mdm, ar, mdm_cfg, n_samples=args.n_samples,
-                                  length=args.length, steps=args.steps, is_mdm=True,
-                                  temperature=args.temperature, top_p=args.top_p)
+    print("[2/5] sample PPL-under-AR (MDM samples, schedule sweep) ...")
+    mdm_ppl_by_sched = {}
+    for sched in ("linear", "cosine", "cosine_inv"):
+        mdm_ppl_by_sched[sched] = sample_ppl_under_ar(
+            mdm, ar, mdm_cfg, n_samples=args.n_samples,
+            length=args.length, steps=args.steps, is_mdm=True,
+            temperature=args.temperature, top_p=args.top_p, schedule=sched)
+        print(f"    {sched}: {mdm_ppl_by_sched[sched]:.2f}")
+    mdm_ppl = mdm_ppl_by_sched["linear"]
     print("[3/5] sample PPL-under-AR (AR samples) ...")
     ar_ppl = sample_ppl_under_ar(ar, ar, ar_cfg, n_samples=args.n_samples,
                                  length=args.length, steps=args.steps, is_mdm=False,
@@ -270,7 +276,7 @@ def main():
     mdm_inf = infill_recovery(mdm, val_data, mdm_cfg, n_trials=args.n_samples,
                               steps=args.steps, temperature=args.temperature, top_p=args.top_p)
 
-    # ----- render table -----
+    # ----- render headline table -----
     rows = [
         ("Val char NLL (lower better)",
          f"≤ {mdm_elbo:.3f} (ELBO)",
@@ -290,14 +296,28 @@ def main():
     table += [f"| {m} | {a} | {b} |" for (m, a, b) in rows]
     md = "\n".join(table)
 
+    # ----- schedule-sweep table -----
+    best = min(mdm_ppl_by_sched, key=mdm_ppl_by_sched.get)
+    sched_rows = ["| Schedule | PPL under AR | Δ vs linear |", "|---|---|---|"]
+    base = mdm_ppl_by_sched["linear"]
+    for s in ("linear", "cosine", "cosine_inv"):
+        ppl = mdm_ppl_by_sched[s]
+        delta = (ppl - base) / base * 100 if base > 0 else 0.0
+        marker = " ← best" if s == best else ""
+        sched_rows.append(f"| {s} | {ppl:.2f}{marker} | {delta:+.1f}% |")
+    sched_md = "\n".join(sched_rows)
+
     print("\n" + "=" * 72)
     print(md)
+    print("\n" + sched_md)
     print("=" * 72)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         f.write("# nanoDLM eval: MDM vs AR\n\n")
-        f.write(md + "\n")
+        f.write(md + "\n\n")
+        f.write("## MDM schedule sweep (PPL under AR scorer)\n\n")
+        f.write(sched_md + "\n")
     print(f"\nwrote {args.out}")
 
 
