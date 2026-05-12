@@ -279,7 +279,7 @@ def main():
     # ----- render headline table -----
     rows = [
         ("Val char NLL (lower better)",
-         f"≤ {mdm_elbo:.3f} (ELBO)",
+         f"<= {mdm_elbo:.3f} (ELBO)",
          f"{ar_nll:.3f}"),
         (f"Sample PPL under AR scorer @ NFE={args.steps} (lower = more on-distribution)",
          f"{mdm_ppl:.2f}",
@@ -298,12 +298,12 @@ def main():
 
     # ----- schedule-sweep table -----
     best = min(mdm_ppl_by_sched, key=mdm_ppl_by_sched.get)
-    sched_rows = ["| Schedule | PPL under AR | Δ vs linear |", "|---|---|---|"]
+    sched_rows = ["| Schedule | PPL under AR | delta vs linear |", "|---|---|---|"]
     base = mdm_ppl_by_sched["linear"]
     for s in ("linear", "cosine", "cosine_inv"):
         ppl = mdm_ppl_by_sched[s]
         delta = (ppl - base) / base * 100 if base > 0 else 0.0
-        marker = " ← best" if s == best else ""
+        marker = " <-- best" if s == best else ""
         sched_rows.append(f"| {s} | {ppl:.2f}{marker} | {delta:+.1f}% |")
     sched_md = "\n".join(sched_rows)
 
