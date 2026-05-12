@@ -16,10 +16,28 @@ from model import DLM
 
 
 @torch.no_grad()
-def generate(model, length=256, steps=64, temperature=1.0, device="cpu", verbose=False, itos=None):
-    """Generate `length` tokens via `steps` rounds of low-confidence remasking."""
+def generate(model, length=256, steps=64, temperature=1.0, device="cpu", verbose=False,
+             itos=None, x_init=None):
+    """Generate via `steps` rounds of low-confidence remasking.
+
+    Two modes:
+      - unconditional: start from all-MASK of `length` tokens (the default).
+      - conditional (infilling): pass `x_init` of shape (1, L) with some
+        positions already filled in (non-MASK). Those positions are frozen
+        for the whole trajectory; only the [MASK]-id positions get denoised.
+        This is what `infill.py` uses to demonstrate the bidirectional
+        prefix+suffix → middle completion that AR models cannot do.
+    """
     model.eval()
-    x = torch.full((1, length), model.mask_id, dtype=torch.long, device=device)
+    if x_init is not None:
+        x = x_init.to(device).clone()
+    else:
+        x = torch.full((1, length), model.mask_id, dtype=torch.long, device=device)
+
+    # Schedule against the count of *initially*-masked positions, not the
+    # full sequence length. Otherwise the first ~(1 - n_masked/L) fraction
+    # of steps are no-ops when most of the sequence is pre-filled.
+    n_to_fill = int((x == model.mask_id).sum().item())
 
     for i in range(steps):
         logits = model(x) / temperature
@@ -38,9 +56,11 @@ def generate(model, length=256, steps=64, temperature=1.0, device="cpu", verbose
         pred = torch.multinomial(probs.reshape(B * T, V), 1).view(B, T)
         conf = probs.gather(-1, pred.unsqueeze(-1)).squeeze(-1)
 
-        # Schedule: how many tokens should remain masked AFTER this step.
+        # Schedule: how many of the initially-masked positions should remain
+        # masked AFTER this step. For pure generation, n_to_fill == length;
+        # for infilling, n_to_fill is the count of [MASK] positions only.
         frac_remaining = 1.0 - (i + 1) / steps
-        n_keep_masked = int(frac_remaining * length)
+        n_keep_masked = int(frac_remaining * n_to_fill)
 
         is_masked = (x == model.mask_id)
         # Only consider currently-masked positions for unmasking.
