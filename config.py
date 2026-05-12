@@ -17,7 +17,12 @@ class Config:
 
     # optim
     batch_size: int = 64
-    max_steps: int = 5000
+    # MDMs need ~2-3x the compute of an AR at matched scale. 5000 steps is
+    # ~82M tokens, below the AR-Chinchilla floor (20 tok/param × 10M = 200M)
+    # and produces samples that have learned the unigram distribution but not
+    # word-level structure. 20000 steps ≈ 330M tokens, where local English
+    # structure starts to emerge on tiny Shakespeare.
+    max_steps: int = 20000
     lr: float = 3e-4
     weight_decay: float = 0.1
     beta1: float = 0.9
@@ -26,9 +31,9 @@ class Config:
     warmup_steps: int = 100
 
     # eval / logging
-    eval_interval: int = 250
+    eval_interval: int = 1000
     eval_iters: int = 50
-    sample_interval: int = 500
+    sample_interval: int = 2000
 
     # diffusion
     eps: float = 1e-3             # min mask ratio to avoid 1/t blowup
