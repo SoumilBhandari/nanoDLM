@@ -24,7 +24,19 @@ def generate(model, length=256, steps=64, temperature=1.0, device="cpu", verbose
     for i in range(steps):
         logits = model(x) / temperature
         probs = logits.softmax(-1)
-        conf, pred = probs.max(-1)                                    # (1, L)
+        # Categorical sampling at every position, not argmax. Two reasons:
+        # (1) argmax is invariant to monotonic transforms of the logits, so
+        #     `temperature` was previously a no-op — this makes it meaningful.
+        # (2) argmax + low-confidence remasking is the textbook source of
+        #     mode collapse in MDM sampling: identical all-MASK context at
+        #     step 1 makes every position vote for the same high-prob token,
+        #     and the resulting attractor poisons the whole trajectory. The
+        #     MDLM / MD4 samplers all draw from the categorical.
+        # Confidence is then the probability *of the sampled token*, which
+        # is the principled signal for low-confidence remasking.
+        B, T, V = probs.shape
+        pred = torch.multinomial(probs.reshape(B * T, V), 1).view(B, T)
+        conf = probs.gather(-1, pred.unsqueeze(-1)).squeeze(-1)
 
         # Schedule: how many tokens should remain masked AFTER this step.
         frac_remaining = 1.0 - (i + 1) / steps
