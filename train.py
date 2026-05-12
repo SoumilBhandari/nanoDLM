@@ -69,14 +69,29 @@ if cfg.compile and device == "cuda":
         print("triton not installed; skipping torch.compile (training will run, just slower)")
 
 
-def loss_fn(model, x):
-    """The whole pedagogical payload of nanoDLM."""
+def loss_fn(model, x, self_cond_prob: float = 0.5):
+    """The whole pedagogical payload of nanoDLM.
+
+    Self-conditioning (Chen et al. 2023): with probability self_cond_prob,
+    do an extra no-grad forward to get the model's own argmax prediction
+    and feed it back as idx_prev on the gradient-bearing forward. Otherwise
+    idx_prev is None and the cond_proj path is a no-op (zero-init). At
+    matched param count this is documented to lift MDM val by ~0.05-0.15
+    nats. Cost: ~50% wallclock since half the batches do 2 forwards.
+    """
     B, T = x.shape
     t = torch.rand(B, 1, device=x.device).clamp(min=cfg.eps)   # per-sample noise
     mask = torch.rand(B, T, device=x.device) < t               # Bernoulli(t)
     x_t = torch.where(mask, MASK_ID, x)                        # corrupt
 
-    logits = model(x_t)                                        # (B, T, V_with_mask)
+    idx_prev = None
+    if torch.rand(()).item() < self_cond_prob:
+        # No-grad first pass produces the self-conditioning input. argmax is
+        # safe because logits[..., MASK_ID] is -inf so MASK is never picked.
+        with torch.no_grad():
+            idx_prev = model(x_t).argmax(dim=-1)
+
+    logits = model(x_t, idx_prev)                              # (B, T, V_with_mask)
     loss_tok = torch.nn.functional.cross_entropy(
         logits.reshape(-1, logits.size(-1)),
         x.reshape(-1),
@@ -99,7 +114,10 @@ def estimate_loss():
         losses = torch.zeros(cfg.eval_iters)
         for k in range(cfg.eval_iters):
             with ctx:
-                losses[k] = loss_fn(model, get_batch(split))
+                # Disable self-conditioning at eval so val loss is directly
+                # comparable to runs without self-cond. The deployment-time
+                # behaviour (self-cond always on) is what `sample.py` exercises.
+                losses[k] = loss_fn(model, get_batch(split), self_cond_prob=0.0)
         out[split] = losses.mean().item()
     model.train()
     return out
