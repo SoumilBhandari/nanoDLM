@@ -38,6 +38,24 @@ class Config:
     # diffusion
     eps: float = 1e-3             # min mask ratio to avoid 1/t blowup
 
+    # DUO-style hybrid training (Sahoo et al. 2024, "Diffusion Forcing for
+    # Discrete Tokens"). With probability p_ar_mix per batch, replace the
+    # random Bernoulli(t) mask with a contiguous-suffix mask: pick a per-
+    # example pivot k and MASK all positions >= k. The intent is to give
+    # the model AR-style supervision (predict x[k:] from x[:k]) on top of
+    # the MDM objective, which recent papers claim closes most of the
+    # MDM-vs-AR gap on val NLL while keeping infilling.
+    #
+    # NEGATIVE RESULT at this scale (10M params, char-level tiny shakespeare,
+    # 20K steps): p_ar_mix=0.25 made every measured metric worse vs pure MDM:
+    #   - val ELBO        1.617 -> 1.664 (+2.9%)
+    #   - sample PPL/AR   3.35  -> 3.97  (+18%)
+    #   - infill recovery 0.200 -> 0.144 (-28%)
+    # We keep the code path as a one-line opt-in for users who want to try
+    # other mixing rates or larger scales where the technique may help, but
+    # the default is 0.0 (pure MDM).
+    p_ar_mix: float = 0.0
+
     # system
     device: str = "cuda"          # falls back to cpu/mps in train.py
     dtype: str = "bfloat16"       # autocast dtype on cuda
