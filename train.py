@@ -69,7 +69,7 @@ if cfg.compile and device == "cuda":
         print("triton not installed; skipping torch.compile (training will run, just slower)")
 
 
-def loss_fn(model, x, self_cond_prob: float = 0.5):
+def loss_fn(model, x, self_cond_prob: float = 0.5, p_ar_mix: float = 0.25):
     """The whole pedagogical payload of nanoDLM.
 
     Self-conditioning (Chen et al. 2023): with probability self_cond_prob,
@@ -78,11 +78,30 @@ def loss_fn(model, x, self_cond_prob: float = 0.5):
     idx_prev is None and the cond_proj path is a no-op (zero-init). At
     matched param count this is documented to lift MDM val by ~0.05-0.15
     nats. Cost: ~50% wallclock since half the batches do 2 forwards.
+
+    DUO hybrid masking (Sahoo et al. 2024): with probability p_ar_mix,
+    replace the random Bernoulli(t) mask with a contiguous-suffix mask
+    so the model gets standard AR-style supervision (predict x[k:] from
+    x[:k]). Same 1/t-weighted CE loss is applied — only the mask shape
+    differs. Set p_ar_mix=0 to recover the pure-MDM training of LLaDA /
+    MDLM / MD4. Set p_ar_mix=1 to train a pure AR with this codebase.
     """
     B, T = x.shape
-    t = torch.rand(B, 1, device=x.device).clamp(min=cfg.eps)   # per-sample noise
-    mask = torch.rand(B, T, device=x.device) < t               # Bernoulli(t)
-    x_t = torch.where(mask, MASK_ID, x)                        # corrupt
+
+    if torch.rand(()).item() < p_ar_mix:
+        # Contiguous-suffix mask: per-example pivot k in [0, T-1], mask the
+        # tail. At least one position is always masked so 1/t doesn't blow
+        # up; the noise level t is just the fraction of masked positions.
+        pivot = torch.randint(0, T, (B, 1), device=x.device)
+        positions = torch.arange(T, device=x.device)[None, :]
+        mask = positions >= pivot                                 # (B, T) bool
+        t = mask.float().mean(dim=-1, keepdim=True).clamp(min=cfg.eps)
+    else:
+        # Standard absorbing-state MDM noising.
+        t = torch.rand(B, 1, device=x.device).clamp(min=cfg.eps)
+        mask = torch.rand(B, T, device=x.device) < t
+
+    x_t = torch.where(mask, MASK_ID, x)                           # corrupt
 
     idx_prev = None
     if torch.rand(()).item() < self_cond_prob:
@@ -114,10 +133,12 @@ def estimate_loss():
         losses = torch.zeros(cfg.eval_iters)
         for k in range(cfg.eval_iters):
             with ctx:
-                # Disable self-conditioning at eval so val loss is directly
-                # comparable to runs without self-cond. The deployment-time
-                # behaviour (self-cond always on) is what `sample.py` exercises.
-                losses[k] = loss_fn(model, get_batch(split), self_cond_prob=0.0)
+                # Disable self-conditioning AND DUO hybrid at eval so val
+                # loss is directly comparable to pure-MDM runs. The deployment
+                # behaviour (self-cond on, hybrid mask off for sampling) is
+                # what `sample.py` exercises.
+                losses[k] = loss_fn(model, get_batch(split),
+                                    self_cond_prob=0.0, p_ar_mix=0.0)
         out[split] = losses.mean().item()
     model.train()
     return out
@@ -167,7 +188,7 @@ for step in range(cfg.max_steps + 1):
 
     x = get_batch("train")
     with ctx:
-        loss = loss_fn(model, x)
+        loss = loss_fn(model, x, p_ar_mix=cfg.p_ar_mix)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
     optimizer.step()
