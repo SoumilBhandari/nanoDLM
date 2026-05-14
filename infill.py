@@ -8,8 +8,12 @@ unconditional generation in `sample.py` does middle-completion here for
 free: we just freeze the prefix and suffix positions and let the
 low-confidence remasking loop denoise the middle.
 
-Example:
-    python infill.py --prefix "ROMEO:" --suffix "I am dead." --middle-length 80
+Examples:
+    # Shakespeare-trained model
+    python infill.py --prefix "ROMEO:" --suffix "JULIET:" --middle-length 120
+
+    # TinyStories-trained model
+    python infill.py --prefix "Once upon a time" --suffix "happily ever after." --middle-length 80
 """
 import argparse
 import os

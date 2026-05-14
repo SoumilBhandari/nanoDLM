@@ -228,8 +228,12 @@ def main():
     p.add_argument("--steps", type=int, default=64)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--seed", type=int, default=0,
+                   help="torch seed for the stochastic sampling metrics")
     p.add_argument("--out", default="out/eval_table.md")
     args = p.parse_args()
+
+    torch.manual_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     for path in (args.mdm_ckpt, args.ar_ckpt):
