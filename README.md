@@ -171,6 +171,29 @@ remain available as flags for experimentation:
 
 (Re-run with `python eval.py` to refresh against your own checkpoints.)
 
+### Block-wise semi-AR sampling
+
+`sample.py --block-len N` (and `generate_blockwise` in code) is the
+Mercury-style trick: generate left-to-right in blocks, denoising each
+block from MASK with the regular sampler before moving on. Same model,
+same architecture, no retraining. At fixed total NFE the quality cost is
+significant — but the win is **time-to-first-token**: you see the first
+block after `steps_per_block` model calls instead of waiting for the
+whole sequence to crystallise. At our scale on Shakespeare:
+
+| Setup | NFE | PPL under AR |
+|---|---|---|
+| full-seq, 64 steps | 64 | 3.54 |
+| 2 blocks x 32 steps | 64 | 3.87 (+9%) |
+| 4 blocks x 16 steps | 64 | 4.96 (+40%) |
+| 8 blocks x 8 steps | 64 | 6.85 (+93%) |
+
+So block-wise is a **latency-vs-quality** dial, not a free speedup at
+this scale. Useful in streaming / interactive settings where you'd
+trade some PPL for partial output sooner. Mercury's reported numbers
+are much better — but they're at a much larger scale and a much
+better-trained model.
+
 ### Negative result: DUO-style hybrid training
 
 We also tested DUO (Sahoo et al. 2024, "Diffusion Forcing for Discrete
