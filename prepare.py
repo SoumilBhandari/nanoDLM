@@ -91,7 +91,11 @@ def main():
     args = p.parse_args()
 
     os.makedirs(DATA, exist_ok=True)
-    input_path = os.path.join(DATA, "input.txt")
+    # Dataset-specific cache filename. Using a single "input.txt" for both
+    # datasets means `prepare.py` then `prepare.py --dataset tinystories`
+    # silently reuses the Shakespeare file — a real bug found in clean-room
+    # testing. Separate names let each dataset cache independently.
+    input_path = os.path.join(DATA, f"input_{args.dataset}.txt")
 
     if not os.path.exists(input_path) or os.path.getsize(input_path) < 1000:
         if args.dataset == "shakespeare":
