@@ -1,317 +1,257 @@
 # nanoDLM
 
+![watch text crystallize from noise](assets/denoising.png)
+
 The simplest masked-diffusion language model you can actually train, debug,
 and learn from. If [nanoGPT](https://github.com/karpathy/nanoGPT) is the
-minimum autoregressive LM, this is the minimum diffusion LM — char-level,
-no tokenizer, no `diffusers`, no HF Trainer. ~1000 lines of pure PyTorch.
+minimum *autoregressive* LM, this is the minimum *diffusion* LM — char-level,
+no tokenizer, no `diffusers`, no HF Trainer. ~1100 lines of plain PyTorch,
+one afternoon to read end to end.
 
-This fork goes past the educational baseline in three ways: it **fixes
-real bugs** in the original objective and sampler, **modernises** the
-backbone (RoPE + self-conditioning), and **puts MDM head-to-head** with a
-matched autoregressive baseline so the trade-off is something you can
-read off a table, not something you have to take on faith.
+The picture above is the whole idea: start from a sequence of all-`[MASK]`
+tokens and, over 16 steps, commit the model's most confident predictions
+until a story falls out of the noise. That's a diffusion language model.
+An autoregressive LM writes left-to-right and never looks back; this one
+denoises the *whole sequence at once* and revisits every position.
 
-## Why this exists
+This is a fork. It does three things to the original educational repo:
+**fixes real bugs** in the objective and sampler, **modernises** the
+backbone (RoPE + self-conditioning), and **puts MDM head-to-head with a
+matched autoregressive baseline** so the trade-off is a table you can read,
+not a claim you have to trust.
 
-Diffusion language models stopped being a curiosity in 2026 — Inception's
-Mercury 2 ships at ~1000 tok/s, LLaDA-8B is competitive with AR at the
-same scale, and the killer feature (left-and-right conditioning, i.e.
-infilling) is something AR architecturally cannot do. Every educational
-LM repo still teaches AR. This one teaches MDM at the same level of
-care, and shows what it costs and what it buys.
+## install
 
-## Quickstart
-
-```bash
+```
 pip install torch numpy
+```
 
-# Default: 1 MB of tiny Shakespeare (canonical, fast, archaic vocab)
-python prepare.py
+That's it. No `transformers`, no `tiktoken`, no `wandb`. (`matplotlib` if
+you want to regenerate the plots in this README, but you don't need to.)
 
-# Recommended for readable samples: 50 MB of TinyStories
-python prepare.py --dataset tinystories
+## quick start
 
-# Train the masked-diffusion LM (~22 min on a 3090, no torch.compile)
+Grab a corpus and turn it into a stream of integers:
+
+```sh
+python prepare.py                        # 1 MB of tiny Shakespeare
+python prepare.py --dataset tinystories  # 50 MB of TinyStories (recommended)
+```
+
+Tiny Shakespeare is the canonical char-level toy set, but it's *small* and
+*archaic* — a 10M-param diffusion model trained on it gets the cadence of
+Shakespeare but the words drift (`thou hast done that scaped with my death`).
+[TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) —
+simple modern children's stories — is small enough to stay an afternoon
+project and rich enough that the same model writes actual sentences. Use it.
+
+Now train. On a single RTX 3090, ~22 minutes, no `torch.compile` needed:
+
+```sh
 python train.py
 python sample.py --verbose --steps 64
+```
 
-# Train the matched autoregressive baseline (~17 min)
-python train_ar.py
+`--verbose` prints the denoising trajectory live — you watch `_` placeholders
+turn into characters, step by step, exactly like the image at the top.
 
-# Head-to-head on shared metrics (single seed)
-python eval.py
+## the lesson: it's about five lines on top of nanoGPT
 
-# Same eval, three seeds, with mean +/- std (use this for any quoted number)
-python eval_multi.py --n-runs 3
+If you know nanoGPT, here's the entire conceptual diff. Six changes:
 
-# The killer feature: middle-completion that AR literally cannot do
+| # | Change | File |
+|---|---|---|
+| 1 | Drop the causal mask in attention (the model sees the whole sequence) | `model.py` |
+| 2 | Vocab += 1 for a `[MASK]` token | `model.py` |
+| 3 | No timestep input — the model infers the noise level from how many `[MASK]`s it sees ([MD4](https://arxiv.org/abs/2406.04329)) | `model.py` |
+| 4 | Loss = 1/t-weighted cross-entropy on the masked positions, normalised by **B·T** | `train.py` |
+| 5 | Sampler = iterative low-confidence remasking, **sampling from the categorical** | `sample.py` |
+| 6 | Schedule against the *initially-masked* count, so infilling can't overwrite frozen tokens | `sample.py` |
+
+The training step, in full:
+
+```python
+t    = torch.rand(B, 1, device=x.device).clamp(min=1e-3)   # noise level per example
+mask = torch.rand(B, T, device=x.device) < t               # Bernoulli(t) per token
+x_t  = torch.where(mask, MASK_ID, x)                        # corrupt
+
+logits   = model(x_t)
+loss_tok = F.cross_entropy(logits.reshape(-1, V), x.reshape(-1),
+                           reduction="none").view(B, T)
+loss = (loss_tok * mask / t).sum() / (B * T)                # the Sahoo et al. ELBO
+```
+
+That's the whole diffusion-LM training objective. No score networks, no
+Gaussian noise, no embedding-space tricks. It's BERT with a random mask
+ratio and a 1/t weight, and the 1/t weight is the absorbing-state ELBO —
+see [Sahoo et al. 2024](https://arxiv.org/abs/2406.07524) §3.
+
+## how it trains
+
+![training curves](assets/training_curves.png)
+
+Both models are 10M params, 6 layers, 384-dim, RoPE positions, trained for
+20K steps on the 50 MB TinyStories slice with identical optimiser settings.
+The MDM is optimising an ELBO (an *upper bound* on NLL); the AR is
+optimising NLL directly. They are not the same axis — but each curve is an
+honest read of how its own model is doing.
+
+The MDM lands at **1.065 nats/char**. The AR lands at **0.526**. The AR
+also does not overfit here — train and val track each other to the last
+step — because 50 MB is plenty of data for a 10M model. (On 1 MB
+Shakespeare it overfits hard, which is why `train_ar.py` always keeps the
+best-val checkpoint.)
+
+## samples
+
+Unconditional, from the MDM after 20K steps (`sample.py --steps 128 --temperature 0.6`):
+
+```
+Tim and Tim was sad and run for it. Tim and his mom and the ball all day.
+The cat was very sad and hit Tim and Tim and Tim was not the ball and the
+cat saw the house. Tim and Tim saw the box and saw Tim and Tim and Tim saw
+his mom and dad.
+```
+
+The matched AR baseline, same corpus (`sample_ar`, `--temperature 0.7`):
+
+```
+Once upon a time, there was a big bear named Ben. Ben lived in a small
+house with his mom and dad. They loved to play together all day long. One
+day, they found a big box. Ben was very curious about what was inside.
+```
+
+lol — the AR is clearly the better storyteller `¯\_(ツ)_/¯`. That's the
+honest result and we'll get to the numbers. But the MDM can do one thing
+the AR architecturally *cannot*:
+
+## the killer feature: infilling
+
+An autoregressive model writes left-to-right. It cannot condition on tokens
+to the *right* of the cursor, so it physically cannot fill a hole in the
+middle of a sequence. A diffusion LM does this for free — freeze the known
+tokens, let the remasking loop denoise the rest:
+
+```sh
 python infill.py --prefix "Once upon a time" \
                  --suffix  "happily ever after." \
                  --middle-length 150
 ```
 
-Watch `sample.py --verbose` — every step replaces some `_` placeholders
-with characters until you have plausible text crystallising from noise.
-
-**Dataset choice matters.** Tiny Shakespeare (~1 MB, archaic char vocab)
-is too small a regime for a 10M-param MDM to produce coherent modern
-English — at 20K steps you get recognisable Shakespearean cadence
-(`thou hast done that scaped with my death`) but words drift. TinyStories
-(50 MB, modern children's stories) takes the same architecture to
-sentence-level coherence:
-
-> *Once upon a time, there was a big bear named Ben. Ben lived in a
-> small house with his mom and dad. They loved to play together all
-> day long. One day, they found a big box. Ben was very curious about
-> what was inside.* — AR baseline, T=0.7
-
-> *Tim and Tim was sad and run for it. Tim and his mom and the ball
-> all day. The cat was very sad and hit Tim and Tim and Tim was not
-> the ball and the cat saw the house. Tim and Tim saw the box and saw
-> Tim and Tim and Tim saw his mom and dad.* — MDM, T=0.6, NFE=128
-
-> *Once upon a time, there was a little girl named Lily. Lily was
-> happy and made they both each after. ... lived happily ever after.*
-> — MDM **infill** ("Once upon a time" → "happily ever after"), the
-> middle 150 chars generated by the model
-
-## The MDM payload — six deltas from nanoGPT
-
-The whole pedagogical core of masked-diffusion-on-top-of-AR is small:
-
-| # | Change | File |
-|---|---|---|
-| 1 | Drop the causal mask in attention | [model.py](model.py) |
-| 2 | Vocab += 1 for the `[MASK]` token | [model.py](model.py) |
-| 3 | Forward signature unchanged — no timestep input (per [MD4](https://arxiv.org/abs/2406.04329) ablations the model infers `t` from mask density) | [model.py](model.py) |
-| 4 | Loss = 1/t-weighted CE on masked positions, normalised by **B·T** (the Sahoo et al. ELBO — not by `mask.sum()`, which is a stochastic denominator and biases gradient scale per-batch) | [train.py](train.py) |
-| 5 | Sampler = iterative low-confidence remasking with **categorical sampling** (argmax + temperature is a no-op and collapses to a single attractor) | [sample.py](sample.py) |
-| 6 | Schedule against the count of *initially-masked* positions, not the full sequence length — otherwise infilling silently overwrites the prefix/suffix | [sample.py](sample.py) |
-
-### The training step, in full
-
-```python
-t = torch.rand(B, 1, device=x.device).clamp(min=1e-3)
-mask = torch.rand(B, T, device=x.device) < t
-x_t = torch.where(mask, MASK_ID, x)
-
-logits = model(x_t)
-loss_tok = F.cross_entropy(logits.reshape(-1, V), x.reshape(-1),
-                           reduction="none").view(B, T)
-loss = (loss_tok * mask / t).sum() / (B * T)        # <-- B*T, not mask.sum()
+```
+Once upon a time, there was a little girl named Lily. Lily was happy and
+made they both each after. ... She lived happily ever after.
 ```
 
-### The sampler, in full
+The prefix and suffix are fixed; everything between is the model writing a
+bridge. This is the entire reason diffusion LMs are interesting, and it is
+the one column in the scoreboard below that the AR simply cannot fill.
 
-```python
-x = torch.full((1, length), MASK_ID, device=device)
-n_to_fill = int((x == MASK_ID).sum().item())
+## the scoreboard
 
-for i in range(steps):
-    logits = model(x); probs = logits.softmax(-1)
-    pred = torch.multinomial(probs.flatten(0, -2), 1).view(probs.shape[:-1])
-    conf = probs.gather(-1, pred.unsqueeze(-1)).squeeze(-1)
+![MDM vs AR](assets/mdm_vs_ar.png)
 
-    n_keep_masked = int((1 - (i+1)/steps) * n_to_fill)
-    is_masked = (x == MASK_ID)
-    n_to_unmask = max(0, int(is_masked.sum().item()) - n_keep_masked)
-
-    conf_masked = conf.masked_fill(~is_masked, float("-inf"))
-    L = conf_masked.size(-1)
-    kth = conf_masked.kthvalue(L - n_to_unmask + 1, dim=-1).values
-    x = torch.where(conf_masked >= kth.unsqueeze(-1), pred, x)
-```
-
-(The actual [sample.py](sample.py) version adds top-p truncation,
-self-conditioning, and a `--schedule {linear, cosine, cosine_inv}` flag.
-Stripped of those, it's the snippet above.)
-
-## Beyond LLaDA — additions that make samples readable
-
-The literal LLaDA recipe is not enough at this scale: 20K steps of the
-plain MDM produces local-fragment soup on Shakespeare and barely-grammatical
-fragments on TinyStories. Several small additions take us from soup to
-recognisable text:
-
-| Addition | File | Why |
-|---|---|---|
-| **RoPE positions** (replaces learned `wpe`) | [model.py](model.py) | Absolute positions underperform on small bidirectional LMs; RoPE composes better with attention. |
-| **Self-conditioning** (Chen et al. 2023 "Analog Bits") | [model.py](model.py), [train.py](train.py) | At training, 50% of batches do an extra no-grad forward and feed the model's own argmax back through a zero-init projection. Standard recipe; fades in as training progresses. |
-| **Top-p truncation** before categorical sampling | [sample.py](sample.py) | Sampling from the full softmax leaks low-probability junk tokens into the output. Default `top_p=0.9`. |
-| **Non-uniform schedule** (`--schedule cosine` / `cosine_inv`) | [sample.py](sample.py) | The linear schedule (1/steps tokens per step) is what LLaDA / MDLM / MD4 use. We add cosine variants and report PPL-under-AR for all three in `eval.py`. None clears a 5% improvement bar so we keep `linear` as default. |
-| **Block-wise semi-AR** (`--block-len N`) | [sample.py](sample.py) | Mercury's chunked-decoding trick. Negative on quality at this scale but real time-to-first-token win. |
-| **DUO hybrid masking** (`p_ar_mix`, opt-in) | [train.py](train.py) | Hurts every metric at this scale — see negative-result section below. Code path stays for anyone exploring other mixing rates. |
-| **TinyStories dataset option** | [prepare.py](prepare.py) | `--dataset tinystories` swaps tiny Shakespeare for a 50 MB slice of TinyStoriesV2. The corpus matters as much as the model. |
-
-## Headline results (TinyStories, 3 seeds)
-
-Generated by `python eval_multi.py --n-runs 3` against the matched MDM
-and AR baselines after 20K training steps each on the 50 MB TinyStories
-corpus. Both models are 10M params, RoPE, same dropout / weight-decay /
-optimizer / total-steps. The AR checkpoint is the **best-val** one
-(saved automatically by `train_ar.py`) — required for honesty on
-Shakespeare where AR overfits hard, harmless on TinyStories where it
-doesn't.
+Generated by `python eval_multi.py --n-runs 3` — three seeds, mean ± std,
+both models matched on architecture / params / steps / data.
 
 | Metric | MDM | AR |
 |---|---|---|
-| Val char NLL (lower better) | <= 1.097 +/- 0.008 (ELBO, upper bound on NLL) | **0.527 +/- 0.001** |
-| Sample PPL under AR scorer @ NFE=64 (lower = more on-distribution) | 3.380 +/- 0.022 | **1.213 +/- 0.019** |
-| Sample distinct-2 (higher = more diverse) | 0.059 +/- 0.002 | **0.081 +/- 0.004** |
-| Sample distinct-3 | 0.149 +/- 0.006 | **0.216 +/- 0.007** |
-| Infill recovery @ span=20, NFE=64 (higher better) | **0.338 +/- 0.029** | N/A (causal AR cannot infill) |
+| Val char NLL (lower better) | ≤ 1.097 ± 0.008 (ELBO) | **0.527 ± 0.001** |
+| Sample PPL under AR scorer @ NFE=64 (lower better) | 3.380 ± 0.022 | **1.213 ± 0.019** |
+| Sample distinct-2 (higher = more diverse) | 0.059 ± 0.002 | **0.081 ± 0.004** |
+| Sample distinct-3 | 0.149 ± 0.006 | **0.216 ± 0.007** |
+| Infill recovery @ span=20 (higher better) | **0.338 ± 0.029** | N/A — AR cannot infill |
 
 Read this honestly:
 
-- **AR wins everywhere it competes**, by margins that are tight even
-  with multi-seed averaging. The diffusion tax is real at this scale.
-  On TinyStories the AR gets to 0.527 nats/char val NLL, which is
-  ~half what the MDM achieves under its absorbing-state ELBO.
-- **MDM owns the infill row.** 34% character-exact recovery on a random
-  20-char val span is genuinely useful (well above the 1/V ~ 1.1%
-  random baseline) and AR cannot produce a number here at all because
-  causal attention cannot condition on tokens to the right of the
-  cursor. That's the entire reason this repo exists.
-- AR overfits Shakespeare (10M params, 1 MB data) but **does not
-  overfit TinyStories** (50 MB) — train and val track each other to
-  the last step. Best-val saving is still on (cheap insurance).
+- **The AR wins every metric where they compete.** The diffusion tax is
+  real at this scale. If you only care about left-to-right next-token
+  quality, train an AR — that's what nanoGPT is for.
+- **The MDM owns the infill row.** 34% character-exact recovery of a
+  random masked 20-char span (vs. a ~1.1% random-guess floor) is genuinely
+  useful, and the AR cannot produce *any* number there. That's the trade.
 
-### Schedule sweep (3 seeds)
+This repo exists to make that trade legible, not to pretend the MDM wins.
 
-| Schedule | PPL under AR (mean +/- std) | delta vs linear |
-|---|---|---|
-| linear | 3.380 +/- 0.022 | +0.0% |
-| cosine | 3.650 +/- 0.091 | +8.0% |
-| cosine_inv | 3.363 +/- 0.083 | -0.5% |
+## things we tried that didn't work
 
-`cosine_inv` lands within the seed-to-seed noise of `linear` (single
-seeds occasionally show it 3% ahead, others have it behind). It does
-not clear the 5%-improvement bar we set for promoting a new default,
-so `linear` stays the default and the others remain as opt-in flags.
+Three of them, kept in the repo as opt-in flags and documented honestly —
+because "we tried X and it didn't help at this scale" is a real result:
 
-### Block-wise semi-AR sampling (3 seeds)
+- **DUO-style hybrid training** (`p_ar_mix` in `config.py`). Mix AR-shaped
+  contiguous masks into MDM training. Recent papers say it closes the
+  AR/MDM gap at scale. At our scale it made every metric *worse* (val ELBO
+  +2.9%, sample PPL +18%, infill −28%). Default is `0.0`.
+- **Block-wise semi-AR sampling** (`--block-len`). Mercury's chunked-decoding
+  trick. At fixed total NFE it is strictly worse than full-sequence sampling
+  here (PPL 3.5 → 8.0 as blocks shrink). It's a real *latency* win — first
+  block out sooner — but not a quality win.
+- **Cosine denoising schedules** (`--schedule cosine|cosine_inv`). Within
+  seed noise of plain `linear`. Doesn't clear a 5% bar, so `linear` stays
+  the default.
 
-Mercury-style chunked inference: split the sequence into K blocks of
-length `L/K`, denoise each block left-to-right at `steps/K` NFE per
-block. The total NFE is the same as the full-sequence sampler. The
-theoretical pitch is faster decoding via cached prefix context.
+## what we fixed in the original
 
-| Block setup | NFE total | PPL under AR (mean +/- std) |
-|---|---|---|
-| full-seq, 64 steps | 64 | **3.503 +/- 0.184** |
-| 2 blocks x 32 steps (block_len=128) | 64 | 3.917 +/- 0.157 |
-| 4 blocks x 16 steps (block_len=64) | 64 | 5.403 +/- 0.336 |
-| 8 blocks x 8 steps (block_len=32) | 64 | 8.017 +/- 0.865 |
+The original repo's loss and sampler had bugs that are easy to make and
+hard to spot — the loss still *descended*, it just descended to the wrong
+place. Worth reading if you're writing diffusion code yourself:
 
-At THIS scale, **block-wise sampling is strictly worse than full-sequence
-sampling at the same total NFE**. Each block has less context to denoise
-against and fewer per-block steps for revision. The technique probably
-pays off at much larger scales where prefix-KV caching is the
-bottleneck; it does not pay off here. Kept as opt-in via the
-`--block-len N` flag in `sample.py` and a real time-to-first-token win
-in streaming / interactive settings where you'd trade some PPL to see
-the first block sooner.
+1. **The loss divided by `mask.sum()` instead of `B·T`.** `mask.sum()` is
+   a *random* quantity (the number of tokens that happened to get masked
+   this batch). The ELBO calls for the deterministic `B·T`. With the
+   stochastic denominator the reported loss converges to ~2H instead of H
+   and the per-batch gradient scale jitters with the mask draw. Fixing
+   this alone dropped final val from **4.05 → 1.99** on Shakespeare.
+2. **`--temperature` did nothing.** The sampler divided logits by
+   temperature and then took `argmax` — and argmax is invariant to any
+   monotonic transform. Fixed by sampling from the categorical.
+3. **Mode collapse from argmax.** At step 1 every position sees the same
+   all-`[MASK]` context, so argmax makes every position vote for the same
+   token. Pre-fix samples literally repeated `tme you yourd tme you`.
+   Categorical sampling breaks the attractor.
+4. **The sampler clobbered the prefix during infilling.** When `kthvalue`
+   landed in the `-inf` region, the `>= -inf` comparison was `True`
+   everywhere and frozen tokens got silently overwritten. Fixed by
+   scheduling against currently-masked positions.
+5. **`max_steps=5000` was below the Chinchilla floor** for a 10M model.
+   Bumped to 20K.
 
-### Negative result: DUO-style hybrid training
+…plus one found by a clean-room run while writing this README: `prepare.py`
+cached every corpus to a fixed `input.txt`, so running it for Shakespeare
+then TinyStories silently reused the Shakespeare file. Now cached per
+dataset.
 
-We also tested DUO (Sahoo et al. 2024, "Diffusion Forcing for Discrete
-Tokens"): with `p_ar_mix=0.25` per batch, replace the random
-Bernoulli(t) mask with a contiguous-suffix mask so the model gets some
-AR-style supervision on top of the MDM objective. Recent papers
-report this closes most of the AR/MDM val-NLL gap at scale. At our
-scale (10M params, char-level, 20K steps, Shakespeare run) it hurt every
-metric we measured:
-
-| Metric | Pure MDM | DUO @ p=0.25 | delta |
-|---|---|---|---|
-| Val ELBO | 1.617 | 1.664 | **+2.9%** |
-| Sample PPL under AR | 3.35 | 3.97 | **+18%** |
-| Infill recovery | 0.200 | 0.144 | **-28%** |
-
-So `p_ar_mix` defaults to `0.0` and the code path stays as an opt-in
-for anyone who wants to try a different mixing rate or a larger scale
-where the technique may help.
-
-## What we fixed while building this fork
-
-The original repo's training and sampling code had three correctness
-bugs and one undertraining issue. Worth documenting because they're the
-kind of mistake that's easy to make and hard to notice when the loss
-descends "looking right":
-
-1. **Loss formula divided by `mask.sum()` instead of `B*T`.**
-   [Sahoo et al. 2024 §3](https://arxiv.org/abs/2406.07524) gives the ELBO as
-   a sum of per-position weighted CEs divided by the **deterministic**
-   sequence length. The original code divided by the count of randomly-masked
-   tokens. Net effect: reported loss converges to ~2H instead of H, and the
-   per-batch gradient scale fluctuates with the random mask draw. On the
-   default config, fixing this dropped final val from **4.05 → 1.99** nats/char.
-   (Diff: `train.py` ~ line 91.)
-
-2. **`--temperature` flag was inert.** The sampler divided logits by
-   temperature and then took argmax, but argmax is invariant under any
-   monotonic transform. Fixed by drawing from the categorical, which
-   also handily breaks the next bug.
-
-3. **Mode collapse from argmax + low-confidence remasking.** At step 1
-   every position sees the same all-MASK context, so every position's
-   argmax is the same high-prior token. The resulting attractor poisons
-   the whole trajectory — pre-fix samples literally repeated phrases
-   like `tme you yourd tme you`. Categorical sampling fixes this.
-
-4. **Sampler schedule clobbered prefix/suffix during infilling.** When
-   `kthvalue` lands inside the `-inf` region (which happens whenever
-   `n_keep_masked` exceeds the count of currently-masked positions), the
-   `>= -inf` comparison is `True` everywhere and frozen tokens get
-   silently overwritten. Fixed by scheduling against the count of
-   currently-masked positions and computing the threshold from the
-   `n_to_unmask`-th largest confidence.
-
-5. **`max_steps=5000` is below the Chinchilla floor.** That's ~82M tokens
-   on a 10M-param model; the AR rule of thumb is ≥ 200M, and MDMs need
-   ~2-3× the compute of an AR at matched scale. Bumped to 20K. The pre-
-   and post-fix val numbers are not comparable until you also fix the
-   step count.
-
-## Explicit non-goals
-
-This repo deliberately does **not** include:
-
-- Classifier-free guidance (it's for instruct models)
-- Timestep embedding (per MD4, not needed at this scale)
-- KV cache for block-wise decoding (block-wise is implemented, the cache isn't)
-- SEDD score-entropy alternative (more general but obscures the core idea)
-- Continuous-time ELBO derivation in code (read [Sahoo et al.](https://arxiv.org/abs/2406.07524) §3)
-- SFT, instruction tuning, RLHF
-- DDP / FSDP / multi-GPU
-- BPE or any tokenizer (char-level only — switching to GPT-2 BPE would add ~19M params for the embedding table alone, breaking the "tiny" identity)
-
-If you want any of these, fork it. The point of this repo is the
-pedagogical core plus an honest head-to-head with AR — not the full
-feature surface.
-
-## File map
+## file map
 
 ```
 nanoDLM/
 ├── config.py      single dataclass of hyperparameters
 ├── prepare.py     shakespeare or tinystories -> bin, --dataset flag
-├── model.py       bidirectional transformer + RoPE + self-cond
+├── model.py       bidirectional transformer + RoPE + self-conditioning
 ├── train.py       masked-diffusion training loop (DUO-mix opt-in)
 ├── sample.py      iterative remasking + top-p + schedule + block-wise
-├── infill.py      middle-completion demo (the killer MDM feature)
-├── model_ar.py    matched AR baseline architecture
-├── train_ar.py    AR baseline training loop, best-val checkpointing
-├── eval.py        shared MDM-vs-AR eval, writes out/eval_table.md
-├── eval_multi.py  3-seed wrapper around eval.py, mean +/- std table
-└── README.md      you are here
+├── infill.py      middle-completion demo — the killer MDM feature
+├── model_ar.py    matched autoregressive baseline
+├── train_ar.py    AR training loop, best-val checkpointing
+├── eval.py        shared MDM-vs-AR eval harness
+├── eval_multi.py  3-seed wrapper, mean ± std
+└── assets/        the figures in this README
 ```
 
-## References
+## what this repo deliberately is not
 
-- **LLaDA** — Nie et al. 2025, *Large Language Diffusion Models* — primary recipe reference, low-confidence remasking sampler.
-- **MD4** — Shi et al. 2024, *Simplified and Generalized Masked Diffusion for Discrete Data* — shows timestep embedding is unnecessary.
-- **MDLM / Sahoo et al.** — 2024, *Simple and Effective Masked Diffusion Language Models* — the ELBO derivation we follow.
-- **SEDD** — Lou et al. 2024, *Discrete Diffusion Modeling by Estimating the Ratios of the Data Distribution* — the alternative we didn't pick.
-- **Analog Bits** — Chen et al. 2023, *Analog Bits: Generating Discrete Data using Diffusion Models with Self-Conditioning* — the self-cond recipe.
-- **RoFormer / RoPE** — Su et al. 2021 — the positional encoding we use.
+No classifier-free guidance, no timestep embedding, no KV cache, no SEDD
+score-entropy variant, no SFT/RLHF, no multi-GPU, no BPE (GPT-2 BPE would
+add ~19M params of embedding table and break the "tiny" identity). If you
+want those, fork it — the point here is the core idea plus an honest
+baseline, not the feature surface.
+
+## references
+
+- **LLaDA** — Nie et al. 2025, *Large Language Diffusion Models* — the low-confidence remasking sampler.
+- **MD4** — Shi et al. 2024, *Simplified and Generalized Masked Diffusion for Discrete Data* — timestep embedding is unnecessary.
+- **MDLM / Sahoo et al.** — 2024, *Simple and Effective Masked Diffusion Language Models* — the ELBO we follow.
+- **SEDD** — Lou et al. 2024, *Discrete Diffusion by Estimating the Ratios of the Data Distribution* — the alternative we didn't pick.
+- **Analog Bits** — Chen et al. 2023 — the self-conditioning recipe.
+- **RoFormer / RoPE** — Su et al. 2021 — the positional encoding.
+- **TinyStories** — Eldan & Li 2023 — the dataset that makes a 10M model readable.
