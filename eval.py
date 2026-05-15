@@ -44,7 +44,7 @@ import torch.nn.functional as F
 from config import Config
 from model import DLM
 from model_ar import ARLM
-from sample import generate
+from sample import generate, generate_blockwise
 
 
 def load_mdm(ckpt_path: str, device: str):
@@ -228,8 +228,12 @@ def main():
     p.add_argument("--steps", type=int, default=64)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--seed", type=int, default=0,
+                   help="torch seed for the stochastic sampling metrics")
     p.add_argument("--out", default="out/eval_table.md")
     args = p.parse_args()
+
+    torch.manual_seed(args.seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     for path in (args.mdm_ckpt, args.ar_ckpt):
@@ -276,6 +280,32 @@ def main():
     mdm_inf = infill_recovery(mdm, val_data, mdm_cfg, n_trials=args.n_samples,
                               steps=args.steps, temperature=args.temperature, top_p=args.top_p)
 
+    print("[6/6] block-wise sampling sweep (same total NFE) ...")
+    blockwise_results = {}
+    # All entries have total NFE = args.steps (e.g. 64). Block-len=length means
+    # equivalent to full-seq (the same generate() codepath), shown as a baseline.
+    for block_len, sub_steps in [(args.length, args.steps),
+                                 (args.length // 2, args.steps // 2),
+                                 (args.length // 4, args.steps // 4),
+                                 (args.length // 8, args.steps // 8)]:
+        if sub_steps < 1:
+            continue
+        nlls = []
+        for _ in range(args.n_samples):
+            out = generate_blockwise(mdm, length=args.length,
+                                     block_len=block_len,
+                                     steps_per_block=sub_steps,
+                                     device="cuda", temperature=args.temperature,
+                                     top_p=args.top_p)
+            nll = score_with_ar(ar, out, mdm_cfg)
+            if not np.isnan(nll):
+                nlls.append(nll)
+        blockwise_results[(block_len, sub_steps)] = float(np.exp(np.mean(nlls)))
+        n_blocks = (args.length + block_len - 1) // block_len
+        print(f"    block_len={block_len}, steps={sub_steps} "
+              f"({n_blocks} blocks, NFE={n_blocks*sub_steps}): "
+              f"PPL={blockwise_results[(block_len, sub_steps)]:.2f}")
+
     # ----- render headline table -----
     rows = [
         ("Val char NLL (lower better)",
@@ -307,9 +337,21 @@ def main():
         sched_rows.append(f"| {s} | {ppl:.2f}{marker} | {delta:+.1f}% |")
     sched_md = "\n".join(sched_rows)
 
+    # ----- block-wise sweep table -----
+    bw_rows = ["| Block setup | NFE total | PPL under AR |", "|---|---|---|"]
+    for (block_len, sub_steps), ppl in blockwise_results.items():
+        n_blocks = (args.length + block_len - 1) // block_len
+        if n_blocks == 1:
+            label = f"full-seq (no blocks), {sub_steps} steps"
+        else:
+            label = f"{n_blocks} blocks x {sub_steps} steps (block_len={block_len})"
+        bw_rows.append(f"| {label} | {n_blocks * sub_steps} | {ppl:.2f} |")
+    bw_md = "\n".join(bw_rows)
+
     print("\n" + "=" * 72)
     print(md)
     print("\n" + sched_md)
+    print("\n" + bw_md)
     print("=" * 72)
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -317,7 +359,9 @@ def main():
         f.write("# nanoDLM eval: MDM vs AR\n\n")
         f.write(md + "\n\n")
         f.write("## MDM schedule sweep (PPL under AR scorer)\n\n")
-        f.write(sched_md + "\n")
+        f.write(sched_md + "\n\n")
+        f.write("## MDM block-wise sampling sweep (Mercury-style semi-AR)\n\n")
+        f.write(bw_md + "\n")
     print(f"\nwrote {args.out}")
 
 

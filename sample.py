@@ -148,6 +148,44 @@ def generate(model, length=256, steps=64, temperature=1.0, top_p=0.9, device="cp
     return x
 
 
+@torch.no_grad()
+def generate_blockwise(model, length: int, block_len: int, steps_per_block: int,
+                       temperature: float = 1.0, top_p: float = 0.9,
+                       device: str = "cpu", self_cond: bool = True,
+                       schedule: str = "linear"):
+    """Block-wise semi-autoregressive diffusion sampling (the Mercury trick).
+
+    Instead of denoising all `length` positions jointly over `steps` rounds,
+    generate left-to-right in blocks of `block_len` tokens. Each block is
+    initialised to all MASK, appended to the already-committed prefix, and
+    denoised with the standard sampler for `steps_per_block` rounds. The
+    committed prefix is frozen (via the same x_init mechanism that powers
+    infill.py), so the sampler refines only the active block.
+
+    Total NFE = n_blocks * steps_per_block. For a length-256 sequence with
+    block_len=64 and steps_per_block=16 that's the same 64 NFE as a single
+    full-sequence run — and what you trade for breaking the joint denoising
+    into chunks is *time-to-first-character*: the first block lands after
+    only steps_per_block model calls instead of waiting for the whole
+    sequence to crystallise.
+
+    Used as a quality-vs-speed sweep against the joint sampler in eval.py.
+    """
+    n_blocks = (length + block_len - 1) // block_len
+    x = torch.empty((1, 0), dtype=torch.long, device=device)
+    for b in range(n_blocks):
+        next_block_len = min(block_len, length - x.size(-1))
+        new_block = torch.full((1, next_block_len), model.mask_id,
+                               dtype=torch.long, device=device)
+        x_init = torch.cat([x, new_block], dim=-1)
+        # Reuse the existing generate() with x_init: the prefix is non-MASK
+        # and gets frozen; only the new block has MASKs and is denoised.
+        x = generate(model, x_init=x_init, steps=steps_per_block,
+                     temperature=temperature, top_p=top_p, device=device,
+                     self_cond=self_cond, schedule=schedule)
+    return x
+
+
 def _load_for_sampling(ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = Config(**ckpt["config"])
@@ -174,6 +212,10 @@ if __name__ == "__main__":
     p.add_argument("--schedule", default="linear",
                    choices=["linear", "cosine", "cosine_inv"],
                    help="masking schedule across denoising steps")
+    p.add_argument("--block-len", type=int, default=0,
+                   help="if > 0, use block-wise semi-AR sampling (Mercury-style) "
+                        "with blocks of this many tokens; total NFE = "
+                        "(length/block-len) * steps")
     p.add_argument("--ablate", action="store_true",
                    help="sweep steps in {1, 4, 16, 64, 256} to show the lesson")
     p.add_argument("--verbose", action="store_true",
@@ -196,6 +238,18 @@ if __name__ == "__main__":
                            self_cond=not args.no_self_cond, schedule=args.schedule)
             print(f"\n--- steps={s} ---")
             print(_decode(out[0].tolist(), itos, model.mask_id))
+    elif args.block_len > 0:
+        out = generate_blockwise(model, length=args.length,
+                                 block_len=args.block_len,
+                                 steps_per_block=args.steps,
+                                 device=device, temperature=args.temperature,
+                                 top_p=args.top_p,
+                                 self_cond=not args.no_self_cond,
+                                 schedule=args.schedule)
+        n_blocks = (args.length + args.block_len - 1) // args.block_len
+        print(f"\n=== block-wise: {n_blocks} blocks x {args.steps} steps "
+              f"= {n_blocks * args.steps} total NFE ===")
+        print(_decode(out[0].tolist(), itos, model.mask_id))
     else:
         out = generate(model, length=args.length, steps=args.steps,
                        device=device, temperature=args.temperature,

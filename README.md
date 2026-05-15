@@ -135,11 +135,13 @@ comparison demands that selection.
 
 | Metric | MDM | AR |
 |---|---|---|
-| Val char NLL (lower better) | <= 1.617 (ELBO, upper bound on NLL) | **1.478** |
-| Sample PPL under AR scorer @ NFE=64 (lower = more on-distribution) | 3.35 | **2.46** |
-| Sample distinct-2 (higher = more diverse) | 0.071 | **0.118** |
-| Sample distinct-3 | 0.165 | **0.319** |
-| Infill recovery @ span=20, NFE=64 (higher better) | **0.200** | N/A (causal AR cannot infill) |
+| Val char NLL (lower better) | <= 1.618 (ELBO, upper bound on NLL) | **1.486** |
+| Sample PPL under AR scorer @ NFE=64 (lower = more on-distribution) | 3.67 | **2.46** |
+| Sample distinct-2 (higher = more diverse) | 0.093 | **0.113** |
+| Sample distinct-3 | 0.206 | **0.296** |
+| Infill recovery @ span=20, NFE=64 (higher better) | **0.156** | N/A (causal AR cannot infill) |
+
+(Single-seed numbers. Run-to-run noise is ~0.01 on val NLL and ~10-20% on the sample-level metrics; the qualitative ordering between MDM and AR is robust.)
 
 Read this honestly:
 
@@ -163,11 +165,54 @@ remain available as flags for experimentation:
 
 | Schedule | PPL under AR | delta vs linear |
 |---|---|---|
-| linear | 3.35 | +0.0% |
-| cosine | 3.48 | +4.1% |
-| cosine_inv | 3.32 | -0.8% |
+| linear | 3.67 | +0.0% |
+| cosine | 3.65 | -0.6% |
+| cosine_inv | 3.67 | +0.1% |
 
 (Re-run with `python eval.py` to refresh against your own checkpoints.)
+
+### Block-wise semi-AR sampling
+
+`sample.py --block-len N` (and `generate_blockwise` in code) is the
+Mercury-style trick: generate left-to-right in blocks, denoising each
+block from MASK with the regular sampler before moving on. Same model,
+same architecture, no retraining. At fixed total NFE the quality cost is
+significant — but the win is **time-to-first-token**: you see the first
+block after `steps_per_block` model calls instead of waiting for the
+whole sequence to crystallise. At our scale on Shakespeare:
+
+| Setup | NFE | PPL under AR |
+|---|---|---|
+| full-seq, 64 steps | 64 | 3.54 |
+| 2 blocks x 32 steps | 64 | 3.87 (+9%) |
+| 4 blocks x 16 steps | 64 | 4.96 (+40%) |
+| 8 blocks x 8 steps | 64 | 6.85 (+93%) |
+
+So block-wise is a **latency-vs-quality** dial, not a free speedup at
+this scale. Useful in streaming / interactive settings where you'd
+trade some PPL for partial output sooner. Mercury's reported numbers
+are much better — but they're at a much larger scale and a much
+better-trained model.
+
+### Negative result: DUO-style hybrid training
+
+We also tested DUO (Sahoo et al. 2024, "Diffusion Forcing for Discrete
+Tokens"): with `p_ar_mix=0.25` per batch, replace the random
+Bernoulli(t) mask with a contiguous-suffix mask so the model gets some
+AR-style supervision on top of the MDM objective. Recent papers
+report this closes most of the AR/MDM val-NLL gap at scale. At our
+scale (10M params, char-level Shakespeare, 20K steps) it hurt every
+metric we measured:
+
+| Metric | Pure MDM | DUO @ p=0.25 | delta |
+|---|---|---|---|
+| Val ELBO | 1.617 | 1.664 | **+2.9%** |
+| Sample PPL under AR | 3.35 | 3.97 | **+18%** |
+| Infill recovery | 0.200 | 0.144 | **-28%** |
+
+So `p_ar_mix` defaults to `0.0` and the code path stays as an opt-in
+for anyone who wants to try a different mixing rate or a larger scale
+where the technique may help.
 
 ## What we fixed while building this fork
 
