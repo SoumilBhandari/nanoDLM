@@ -238,14 +238,6 @@ nanoDLM/
 └── assets/        the figures in this README
 ```
 
-## what this repo deliberately is not
-
-No classifier-free guidance, no timestep embedding, no KV cache, no SEDD
-score-entropy variant, no SFT/RLHF, no multi-GPU, no BPE (GPT-2 BPE would
-add ~19M params of embedding table and break the "tiny" identity). If you
-want those, fork it — the point here is the core idea plus an honest
-baseline, not the feature surface.
-
 ## references
 
 - **LLaDA** — Nie et al. 2025, *Large Language Diffusion Models* — the low-confidence remasking sampler.
